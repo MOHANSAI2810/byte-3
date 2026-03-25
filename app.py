@@ -4,6 +4,8 @@ import tempfile
 import zipfile
 import uuid
 import sys
+import boto3
+from botocore.exceptions import ClientError
 import mysql.connector
 from mysql.connector import Error
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Request, Form, Depends
@@ -13,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 from main import generate_llm_analysis, create_word_doc
 from src.data_loader import load_and_process_data
 from auth import router as auth_router, get_current_user, get_db
+from urllib.parse import urlparse
 
 app = FastAPI(title="ByTE Report Generator API")
 app.include_router(auth_router)
@@ -22,11 +25,23 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 templates = Jinja2Templates(directory="templates")
 
-# Ensure temporary and persistent directories exist
+# AWS S3 Configuration
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_BUCKET_NAME = os.getenv('AWS_BUCKET_NAME')
+AWS_REGION = os.getenv('AWS_REGION', 'eu-north-1')
+
+# Initialize S3 client
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=AWS_REGION
+)
+
+# Ensure temporary directory exists
 TEMP_BASE_DIR = os.path.join(tempfile.gettempdir(), "byte_reports")
-PERSISTENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "reports")
 os.makedirs(TEMP_BASE_DIR, exist_ok=True)
-os.makedirs(PERSISTENT_DIR, exist_ok=True)
 
 def cleanup_files(*paths):
     """Cleanup temporary files and directories."""
@@ -38,6 +53,51 @@ def cleanup_files(*paths):
                 shutil.rmtree(path)
         except Exception as e:
             print(f"Error during cleanup of {path}: {e}")
+
+def upload_to_s3(file_path, user_id, file_name):
+    """Upload file to S3 and return the S3 URL"""
+    try:
+        # Create S3 key with user_id folder structure
+        s3_key = f"{user_id}/{file_name}"
+        
+        # Upload file to S3
+        s3_client.upload_file(
+            file_path,
+            AWS_BUCKET_NAME,
+            s3_key,
+            ExtraArgs={'ContentType': 'application/zip'}
+        )
+        
+        # Generate S3 URL
+        s3_url = f"https://{AWS_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+        
+        return s3_key, s3_url
+    except ClientError as e:
+        print(f"Error uploading to S3: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload file to S3: {str(e)}")
+
+def delete_from_s3(s3_key):
+    """Delete file from S3"""
+    try:
+        s3_client.delete_object(Bucket=AWS_BUCKET_NAME, Key=s3_key)
+    except ClientError as e:
+        print(f"Error deleting from S3: {e}")
+
+def get_s3_presigned_url(s3_key, expiration=3600):
+    """Generate a presigned URL for temporary access"""
+    try:
+        response = s3_client.generate_presigned_url(
+            'get_object',
+            Params={
+                'Bucket': AWS_BUCKET_NAME,
+                'Key': s3_key
+            },
+            ExpiresIn=expiration
+        )
+        return response
+    except ClientError as e:
+        print(f"Error generating presigned URL: {e}")
+        return None
 
 @app.get("/")
 async def root():
@@ -99,9 +159,7 @@ async def generate_reports(
 
         final_class_name = internal_class if internal_class else os.path.splitext(file.filename)[0]
 
-        # Generate reports (Limited to a few for testing if needed, but here we process all)
-        # However, for API we might want to avoid long timeouts. 
-        # For now, we process all but you might want to consider async processing if the list is huge.
+        # Generate reports
         for idx, student in enumerate(students, 1):
             name = student.get('name', 'Unknown')
             analysis, meta = generate_llm_analysis(student, name, final_class_name)
@@ -110,29 +168,39 @@ async def generate_reports(
             else:
                 print(f"Failed to generate analysis for: {name}")
 
-        # Create ZIP file in permanent storage
+        # Create ZIP file locally
         zip_filename = f"{final_class_name}_Reports.zip"
-        storage_filename = f"{current_user['id']}_{request_id}_{zip_filename}"
-        zip_path = os.path.join(PERSISTENT_DIR, storage_filename)
+        unique_zip_name = f"{current_user['id']}_{request_id}_{zip_filename}"
+        zip_path = os.path.join(request_dir, unique_zip_name)
         
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(output_dir):
                 for f in files:
                     zipf.write(os.path.join(root, f), f)
 
-        # Connect to DB and save document
+        # Upload ZIP to S3
+        s3_key, s3_url = upload_to_s3(zip_path, str(current_user['id']), unique_zip_name)
+
+        # Save report info to MySQL
         cursor = db.cursor()
-        cursor.execute("INSERT INTO reports (user_id, file_name, file_key, file_url) VALUES (%s, %s, %s, %s)", 
-                       (current_user['id'], zip_filename, storage_filename, zip_path))
+        cursor.execute(
+            "INSERT INTO reports (user_id, file_name, file_key, file_url) VALUES (%s, %s, %s, %s)", 
+            (current_user['id'], zip_filename, s3_key, s3_url)
+        )
         db.commit()
 
-        # Schedule cleanup only for temps
+        # Schedule cleanup of temporary files
         background_tasks.add_task(cleanup_files, request_dir)
 
-        return FileResponse(
-            path=zip_path,
-            filename=zip_filename,
-            media_type="application/zip"
+        # Return the S3 URL for immediate download
+        return JSONResponse(
+            status_code=200,
+            content={
+                "message": "Reports generated successfully",
+                "file_name": zip_filename,
+                "download_url": s3_url,
+                "report_id": cursor.lastrowid
+            }
         )
 
     except Exception as e:
@@ -147,21 +215,72 @@ async def generate_reports(
 @app.get("/my-reports")
 def my_reports(current_user: dict = Depends(get_current_user), db: mysql.connector.MySQLConnection = Depends(get_db)):
     cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT id, file_name as filename, created_at FROM reports WHERE user_id=%s ORDER BY created_at DESC", (current_user['id'],))
+    cursor.execute(
+        "SELECT id, file_name as filename, file_url, created_at FROM reports WHERE user_id=%s ORDER BY created_at DESC", 
+        (current_user['id'],)
+    )
     records = cursor.fetchall()
-    docs = [{"id": r["id"], "filename": r["filename"], "created_at": r["created_at"]} for r in records]
+    
+    # Add presigned URLs for each report (optional - if you want time-limited access)
+    docs = []
+    for r in records:
+        doc = {
+            "id": r["id"],
+            "filename": r["filename"],
+            "created_at": r["created_at"],
+            "download_url": r["file_url"]  # Use permanent S3 URL
+        }
+        docs.append(doc)
+    
     return docs
 
 @app.get("/download-report/{doc_id}")
-def download_report(doc_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.MySQLConnection = Depends(get_db)):
+def download_report(
+    doc_id: int, 
+    current_user: dict = Depends(get_current_user), 
+    db: mysql.connector.MySQLConnection = Depends(get_db)
+):
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM reports WHERE id=%s AND user_id=%s", (doc_id, current_user['id']))
     doc = cursor.fetchone()
     
-    if not doc or not os.path.exists(doc["file_url"]):
-        raise HTTPException(status_code=404, detail="Document not found or deleted")
-        
-    return FileResponse(path=doc["file_url"], filename=doc["file_name"], media_type="application/zip")
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Return the S3 URL directly
+    # You can also generate a presigned URL for additional security
+    return JSONResponse(
+        status_code=200,
+        content={
+            "file_name": doc["file_name"],
+            "download_url": doc["file_url"]
+        }
+    )
+
+@app.delete("/delete-report/{doc_id}")
+def delete_report(
+    doc_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.MySQLConnection = Depends(get_db)
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM reports WHERE id=%s AND user_id=%s", (doc_id, current_user['id']))
+    doc = cursor.fetchone()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Delete from S3
+    delete_from_s3(doc["file_key"])
+    
+    # Delete from database
+    cursor.execute("DELETE FROM reports WHERE id=%s", (doc_id,))
+    db.commit()
+    
+    return JSONResponse(
+        status_code=200,
+        content={"message": "Report deleted successfully"}
+    )
 
 if __name__ == "__main__":
     import uvicorn

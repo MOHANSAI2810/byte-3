@@ -4,6 +4,7 @@ const History = ({ token }) => {
     const [reports, setReports] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [downloadingId, setDownloadingId] = useState(null);
 
     useEffect(() => {
         const fetchReports = async () => {
@@ -31,22 +32,26 @@ const History = ({ token }) => {
         }
     }, [token]);
 
-    const handleDownload = async (id, filename) => {
+    // FIXED: Download using the direct S3 URL
+    const handleDownload = async (reportId, filename, downloadUrl) => {
+        setDownloadingId(reportId);
         try {
-            const response = await fetch(`/download-report/${id}`, {
-                headers: {
-                    'Authorization': `Bearer ${token}`
-                }
-            });
-            if (!response.ok) throw new Error('Download failed');
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            a.click();
+            // Option 1: Direct download using window.open (simplest and works best)
+            window.open(downloadUrl, '_blank');
+            
+            // Option 2: If you want to track download completion, use this:
+            // const link = document.createElement('a');
+            // link.href = downloadUrl;
+            // link.download = filename;
+            // document.body.appendChild(link);
+            // link.click();
+            // document.body.removeChild(link);
+            
         } catch (err) {
-            alert(err.message);
+            console.error('Download error:', err);
+            alert('Failed to download file. Please try again.');
+        } finally {
+            setDownloadingId(null);
         }
     };
 
@@ -83,10 +88,11 @@ const History = ({ token }) => {
                                         </td>
                                         <td className="p-4 text-right">
                                             <button
-                                                onClick={() => handleDownload(report.id, report.filename)}
-                                                className="text-byte-green font-bold text-sm tracking-wide hover:text-white transition-colors"
+                                                onClick={() => handleDownload(report.id, report.filename, report.download_url)}
+                                                disabled={downloadingId === report.id}
+                                                className="text-byte-green font-bold text-sm tracking-wide hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                             >
-                                                Download ↓
+                                                {downloadingId === report.id ? 'Opening...' : 'Download ↓'}
                                             </button>
                                         </td>
                                     </tr>
